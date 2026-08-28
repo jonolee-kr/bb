@@ -115,9 +115,9 @@
   "scripts": {
     "build": "node scripts/build-runtime.mjs",
     "build:runtime": "node scripts/build-runtime.mjs",
-    "build:types": "node scripts/build-bundled-dts.mjs",
+    "build:types": "node scripts/build-bundled-dts.mjs --max-workers=1",
     "clean": "rimraf bundled-types dist tsconfig.tsbuildinfo",
-    "prepack": "node scripts/build-bundled-dts.mjs && node scripts/build-runtime.mjs",
+    "prepack": "node scripts/build-bundled-dts.mjs --max-workers=1 && node scripts/build-runtime.mjs",
     "test": "vitest run --config vitest.config.ts",
     "typecheck": "tsc --noEmit"
   },

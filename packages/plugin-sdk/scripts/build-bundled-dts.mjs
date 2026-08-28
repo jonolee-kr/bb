@@ -18,11 +18,14 @@
 // mtimes stay stable for watchers.
 import { spawn, spawnSync } from "node:child_process";
 import {
+  accessSync,
+  constants as fsConstants,
   existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { availableParallelism } from "node:os";
@@ -37,6 +40,16 @@ import {
 import { rollup } from "rollup";
 import { dts } from "rollup-plugin-dts";
 
+import {
+  BB_DTS_MAX_WORKERS,
+  BB_DTS_REEXEC,
+  BB_DTS_SLICE,
+  decideIsolation,
+  isInCgroupUnit,
+  primaryCgroupPath,
+  resolveWorkerConfiguration,
+  runWorkerPool,
+} from "./build-bundled-dts-support.mjs";
 import { normalizeBundledDts } from "./normalize-bundled-dts.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -183,28 +196,9 @@ function generateBundle(entry) {
 // apiece. They are independent, so this file re-runs itself as a worker per
 // entry. The pool is deliberately bounded because each rollup-plugin-dts
 // program can consume substantial memory independently of Turbo concurrency.
-const DEFAULT_MAX_WORKERS = 1;
-const HARD_MAX_WORKERS = 2;
-const DTS_MAX_WORKERS_ENV = "BB_DTS_MAX_WORKERS";
-const DTS_SLICE = "bb-dts.slice";
-const BB_SERVICE = "bb-jsl.service";
 const DTS_LOCK_TIMEOUT_SECONDS = 900;
 const DTS_RUNTIME_MAX = "30min";
-
-function resolveMaxWorkers() {
-  const raw = process.env[DTS_MAX_WORKERS_ENV];
-  if (raw === undefined || raw === "") return DEFAULT_MAX_WORKERS;
-  if (!/^[1-9]\d*$/.test(raw)) {
-    throw new Error(`${DTS_MAX_WORKERS_ENV} must be a positive integer`);
-  }
-  const parsed = Number(raw);
-  if (!Number.isSafeInteger(parsed) || parsed > HARD_MAX_WORKERS) {
-    throw new Error(
-      `${DTS_MAX_WORKERS_ENV} must be between 1 and ${HARD_MAX_WORKERS}`,
-    );
-  }
-  return parsed;
-}
+const STANDARD_LINUX_COMMAND_DIRS = ["/usr/bin", "/bin"];
 
 function readSelfCgroup() {
   if (process.platform !== "linux") return "";
@@ -215,36 +209,65 @@ function readSelfCgroup() {
   }
 }
 
-function isInCgroupUnit(cgroup, unit) {
-  return cgroup.split("\n").some((line) => {
-    const cgroupPath = line.slice(line.lastIndexOf(":") + 1);
-    return cgroupPath.split("/").includes(unit);
-  });
+function resolveExecutable(command) {
+  // Provider shells can replace PATH. Search it first, then the standard Linux
+  // directories. Verify every result instead of trusting fixed /usr/bin paths.
+  const directories = [
+    ...(process.env.PATH ?? "").split(path.delimiter),
+    ...STANDARD_LINUX_COMMAND_DIRS,
+  ].filter(Boolean);
+  for (const directory of new Set(directories)) {
+    const candidate = path.join(directory, command);
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {
+      // Continue to the next candidate.
+    }
+  }
+  throw new Error(
+    `Required DTS isolation command "${command}" is not executable. ` +
+      `Checked PATH and ${STANDARD_LINUX_COMMAND_DIRS.join(", ")}.`,
+  );
 }
 
 function getDtsSliceState() {
   if (process.platform !== "linux") {
-    return { available: false, loaded: false, detail: "not Linux" };
+    return {
+      loaded: false,
+      detail: "not Linux",
+      systemctlPath: null,
+    };
+  }
+  let systemctlPath;
+  try {
+    systemctlPath = resolveExecutable("systemctl");
+  } catch (error) {
+    return {
+      loaded: false,
+      detail: error instanceof Error ? error.message : String(error),
+      systemctlPath: null,
+    };
   }
   const result = spawnSync(
-    "/usr/bin/systemctl",
-    ["--user", "show", DTS_SLICE, "--property=LoadState", "--value"],
+    systemctlPath,
+    ["--user", "show", BB_DTS_SLICE, "--property=LoadState", "--value"],
     { encoding: "utf8" },
   );
   return {
-    available: result.status === 0,
     loaded: result.status === 0 && result.stdout.trim() === "loaded",
     detail:
-      result.error?.message ??
-      result.stderr?.trim() ??
-      result.stdout?.trim() ??
+      result.error?.message ||
+      result.stderr?.trim() ||
+      result.stdout?.trim() ||
       `systemctl exited ${result.status ?? "without a status"}`,
+    systemctlPath,
   };
 }
 
 function getDtsLockPath() {
   const runtimeDir =
-    process.env.XDG_RUNTIME_DIR ??
+    process.env.XDG_RUNTIME_DIR ||
     (typeof process.getuid === "function"
       ? `/run/user/${process.getuid()}`
       : null);
@@ -253,34 +276,46 @@ function getDtsLockPath() {
       "Cannot determine the per-user runtime directory for the DTS build lock",
     );
   }
+  try {
+    accessSync(runtimeDir, fsConstants.W_OK | fsConstants.X_OK);
+  } catch (error) {
+    throw new Error(
+      `Cannot write the DTS build lock in ${runtimeDir}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   return path.join(runtimeDir, "bb-dts-build.lock");
 }
 
-async function runInDtsScope(maxWorkers) {
+async function runInDtsScope(maxWorkers, systemctlPath) {
   const scope = `bb-dts-${process.pid}-${Date.now()}.scope`;
+  const flockPath = resolveExecutable("flock");
+  const systemdRunPath = resolveExecutable("systemd-run");
   const childEnv = { ...process.env };
   // A legacy preload used this variable as a recursion guard. Do not carry a
   // caller-provided value into the authoritative cgroup-based implementation.
   delete childEnv.BB_DTS_ISOLATED;
   const child = spawn(
-    "/usr/bin/flock",
+    flockPath,
     [
       "--exclusive",
+      "--no-fork",
       "--timeout",
       String(DTS_LOCK_TIMEOUT_SECONDS),
       "--conflict-exit-code",
       "75",
       getDtsLockPath(),
-      "/usr/bin/systemd-run",
+      systemdRunPath,
       "--user",
       "--scope",
       "--quiet",
       "--collect",
-      `--slice=${DTS_SLICE}`,
+      "--same-dir",
+      `--slice=${BB_DTS_SLICE}`,
       `--unit=${scope}`,
       `--property=RuntimeMaxSec=${DTS_RUNTIME_MAX}`,
-      "/usr/bin/env",
-      `${DTS_MAX_WORKERS_ENV}=${maxWorkers}`,
+      `--setenv=${BB_DTS_REEXEC}=1`,
+      `--setenv=${BB_DTS_MAX_WORKERS}=${maxWorkers}`,
       process.execPath,
       ...process.execArgv,
       ...process.argv.slice(1),
@@ -289,17 +324,22 @@ async function runInDtsScope(maxWorkers) {
   );
 
   let interruptedExitCode = null;
-  const terminateScope = (exitCode) => {
+  const terminateScope = (signal, exitCode) => {
     if (interruptedExitCode !== null) return;
     interruptedExitCode = exitCode;
-    child.kill("SIGTERM");
-    spawnSync("/usr/bin/systemctl", ["--user", "stop", scope], {
+    child.kill(signal);
+    spawnSync(
+      systemctlPath,
+      ["--user", "kill", `--signal=${signal}`, "--kill-who=all", scope],
+      { stdio: "ignore" },
+    );
+    spawnSync(systemctlPath, ["--user", "stop", scope], {
       stdio: "ignore",
     });
   };
-  const onSighup = () => terminateScope(129);
-  const onSigint = () => terminateScope(130);
-  const onSigterm = () => terminateScope(143);
+  const onSighup = () => terminateScope("SIGHUP", 129);
+  const onSigint = () => terminateScope("SIGINT", 130);
+  const onSigterm = () => terminateScope("SIGTERM", 143);
   process.once("SIGHUP", onSighup);
   process.once("SIGINT", onSigint);
   process.once("SIGTERM", onSigterm);
@@ -326,7 +366,7 @@ async function runInDtsScope(maxWorkers) {
     );
   }
   if (result.code === 75) {
-    throw new Error(
+    console.error(
       `Timed out after ${DTS_LOCK_TIMEOUT_SECONDS}s waiting for another bundled-DTS build`,
     );
   }
@@ -345,45 +385,52 @@ if (!isMainThread) {
 }
 
 async function main() {
-  const maxWorkers = resolveMaxWorkers();
+  const workerConfiguration = resolveWorkerConfiguration({
+    args: process.argv.slice(2),
+    envValue: process.env[BB_DTS_MAX_WORKERS],
+    availableCpuCount: availableParallelism(),
+    outputCount: Object.keys(outputs).length,
+  });
   const cgroup = readSelfCgroup();
-  const isolated = isInCgroupUnit(cgroup, DTS_SLICE);
-  if (!isolated) {
-    const sliceState = getDtsSliceState();
-    if (sliceState.loaded) {
-      await runInDtsScope(maxWorkers);
-      return;
+  const alreadyIsolated = isInCgroupUnit(cgroup, BB_DTS_SLICE);
+  const reexecMarker = process.env[BB_DTS_REEXEC] === "1";
+  const sliceState =
+    process.platform === "linux" && !alreadyIsolated && !reexecMarker
+      ? getDtsSliceState()
+      : { loaded: false, detail: "not checked", systemctlPath: null };
+  const isolation = decideIsolation({
+    platform: process.platform,
+    cgroup,
+    reexecMarker,
+    sliceLoaded: sliceState.loaded,
+    sliceDetail: sliceState.detail,
+  });
+  if (isolation.kind === "fail") throw new Error(isolation.message);
+  if (isolation.kind === "reexec") {
+    if (!sliceState.systemctlPath) {
+      throw new Error(`Cannot enter ${BB_DTS_SLICE}: systemctl is unavailable`);
     }
-    if (isInCgroupUnit(cgroup, BB_SERVICE)) {
-      throw new Error(
-        `Refusing to build bundled declarations inside ${BB_SERVICE}: ` +
-          `${DTS_SLICE} is unavailable (${sliceState.detail})`,
-      );
-    }
+    await runInDtsScope(
+      workerConfiguration.requested,
+      sliceState.systemctlPath,
+    );
+    return;
+  }
+  if (isolation.warning) {
+    console.warn(`[build-bundled-dts] warning: ${isolation.warning}`);
   }
 
-  const generated = {};
-  const queue = Object.entries(outputs);
-  const workers = Math.min(queue.length, availableParallelism(), maxWorkers);
+  const cgroupPath = isolation.cgroupPath || primaryCgroupPath(cgroup);
   console.log(
-    `[build-bundled-dts] workers=${workers} isolated=${isolated} pid=${process.pid}`,
+    `[build-bundled-dts] workers=${workerConfiguration.effective} ` +
+      `pid=${process.pid} isolation=${isolation.isolated ? "active" : "inactive"} ` +
+      `cgroup=${cgroupPath || "unavailable"}`,
   );
-  const activeWorkers = new Set();
-  try {
-    await Promise.all(
-      Array.from({ length: workers }, async () => {
-        for (let next = queue.shift(); next; next = queue.shift()) {
-          const [fileName, entry] = next;
-          generated[fileName] = await generateInWorker(entry, activeWorkers);
-        }
-      }),
-    );
-  } catch (error) {
-    await Promise.allSettled(
-      Array.from(activeWorkers, (worker) => worker.terminate()),
-    );
-    throw error;
-  }
+  const generated = await runWorkerPool({
+    entries: Object.entries(outputs),
+    workerCount: workerConfiguration.effective,
+    createJob: createWorkerJob,
+  });
   // Keep the declared order so a diff of the outputs stays readable.
   writeOutputs(
     Object.fromEntries(
@@ -392,37 +439,30 @@ async function main() {
   );
 }
 
-function generateInWorker(entry, activeWorkers) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL(import.meta.url), {
-      workerData: { entry },
+function createWorkerJob(entry) {
+  const worker = new Worker(new URL(import.meta.url), {
+    workerData: { entry },
+  });
+  const result = new Promise((resolve, reject) => {
+    let received = false;
+    let content;
+    worker.once("message", (message) => {
+      received = true;
+      content = message;
     });
-    let result;
-    let receivedResult = false;
-    let settled = false;
-    const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      reject(error);
-    };
-    activeWorkers.add(worker);
-    worker.once("message", (value) => {
-      result = value;
-      receivedResult = true;
-    });
-    worker.once("error", fail);
+    worker.once("messageerror", reject);
+    worker.once("error", reject);
     worker.once("exit", (code) => {
-      activeWorkers.delete(worker);
       if (code !== 0) {
-        fail(new Error(`bundle worker exited with ${code}`));
-      } else if (!receivedResult) {
-        fail(new Error("bundle worker exited without returning a result"));
-      } else if (!settled) {
-        settled = true;
-        resolve(result);
+        reject(new Error(`bundle worker exited with ${code}`));
+      } else if (!received) {
+        reject(new Error("bundle worker exited without a declaration result"));
+      } else {
+        resolve(content);
       }
     });
   });
+  return { result, terminate: () => worker.terminate() };
 }
 
 function writeOutputs(generated) {
