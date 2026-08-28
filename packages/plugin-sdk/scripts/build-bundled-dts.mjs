@@ -16,6 +16,7 @@
 // time by file path (no package edge, to avoid a dependency cycle), and the
 // in-repo plugins typecheck against it. Unchanged files are not rewritten so
 // mtimes stay stable for watchers.
+import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -180,8 +181,163 @@ function generateBundle(entry) {
 // Each bundle builds its own TypeScript program, which is CPU-bound and
 // single-threaded inside rollup-plugin-dts; the six large entries take 2–7s
 // apiece. They are independent, so this file re-runs itself as a worker per
-// entry, as many at a time as there are cores, and the serial ~27s becomes
-// roughly the longest single bundle.
+// entry. The pool is deliberately bounded because each rollup-plugin-dts
+// program can consume substantial memory independently of Turbo concurrency.
+const DEFAULT_MAX_WORKERS = 1;
+const HARD_MAX_WORKERS = 2;
+const DTS_MAX_WORKERS_ENV = "BB_DTS_MAX_WORKERS";
+const DTS_SLICE = "bb-dts.slice";
+const BB_SERVICE = "bb-jsl.service";
+const DTS_LOCK_TIMEOUT_SECONDS = 900;
+const DTS_RUNTIME_MAX = "30min";
+
+function resolveMaxWorkers() {
+  const raw = process.env[DTS_MAX_WORKERS_ENV];
+  if (raw === undefined || raw === "") return DEFAULT_MAX_WORKERS;
+  if (!/^[1-9]\d*$/.test(raw)) {
+    throw new Error(`${DTS_MAX_WORKERS_ENV} must be a positive integer`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed > HARD_MAX_WORKERS) {
+    throw new Error(
+      `${DTS_MAX_WORKERS_ENV} must be between 1 and ${HARD_MAX_WORKERS}`,
+    );
+  }
+  return parsed;
+}
+
+function readSelfCgroup() {
+  if (process.platform !== "linux") return "";
+  try {
+    return readFileSync("/proc/self/cgroup", "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function isInCgroupUnit(cgroup, unit) {
+  return cgroup.split("\n").some((line) => {
+    const cgroupPath = line.slice(line.lastIndexOf(":") + 1);
+    return cgroupPath.split("/").includes(unit);
+  });
+}
+
+function getDtsSliceState() {
+  if (process.platform !== "linux") {
+    return { available: false, loaded: false, detail: "not Linux" };
+  }
+  const result = spawnSync(
+    "/usr/bin/systemctl",
+    ["--user", "show", DTS_SLICE, "--property=LoadState", "--value"],
+    { encoding: "utf8" },
+  );
+  return {
+    available: result.status === 0,
+    loaded: result.status === 0 && result.stdout.trim() === "loaded",
+    detail:
+      result.error?.message ??
+      result.stderr?.trim() ??
+      result.stdout?.trim() ??
+      `systemctl exited ${result.status ?? "without a status"}`,
+  };
+}
+
+function getDtsLockPath() {
+  const runtimeDir =
+    process.env.XDG_RUNTIME_DIR ??
+    (typeof process.getuid === "function"
+      ? `/run/user/${process.getuid()}`
+      : null);
+  if (!runtimeDir) {
+    throw new Error(
+      "Cannot determine the per-user runtime directory for the DTS build lock",
+    );
+  }
+  return path.join(runtimeDir, "bb-dts-build.lock");
+}
+
+async function runInDtsScope(maxWorkers) {
+  const scope = `bb-dts-${process.pid}-${Date.now()}.scope`;
+  const childEnv = { ...process.env };
+  // A legacy preload used this variable as a recursion guard. Do not carry a
+  // caller-provided value into the authoritative cgroup-based implementation.
+  delete childEnv.BB_DTS_ISOLATED;
+  const child = spawn(
+    "/usr/bin/flock",
+    [
+      "--exclusive",
+      "--timeout",
+      String(DTS_LOCK_TIMEOUT_SECONDS),
+      "--conflict-exit-code",
+      "75",
+      getDtsLockPath(),
+      "/usr/bin/systemd-run",
+      "--user",
+      "--scope",
+      "--quiet",
+      "--collect",
+      `--slice=${DTS_SLICE}`,
+      `--unit=${scope}`,
+      `--property=RuntimeMaxSec=${DTS_RUNTIME_MAX}`,
+      "/usr/bin/env",
+      `${DTS_MAX_WORKERS_ENV}=${maxWorkers}`,
+      process.execPath,
+      ...process.execArgv,
+      ...process.argv.slice(1),
+    ],
+    { cwd: process.cwd(), env: childEnv, stdio: "inherit" },
+  );
+
+  let interruptedExitCode = null;
+  const terminateScope = (exitCode) => {
+    if (interruptedExitCode !== null) return;
+    interruptedExitCode = exitCode;
+    child.kill("SIGTERM");
+    spawnSync("/usr/bin/systemctl", ["--user", "stop", scope], {
+      stdio: "ignore",
+    });
+  };
+  const onSighup = () => terminateScope(129);
+  const onSigint = () => terminateScope(130);
+  const onSigterm = () => terminateScope(143);
+  process.once("SIGHUP", onSighup);
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+
+  let result;
+  try {
+    result = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+  } finally {
+    process.off("SIGHUP", onSighup);
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigterm);
+  }
+
+  if (interruptedExitCode !== null) {
+    process.exitCode = interruptedExitCode;
+    return;
+  }
+  if (result.code === null) {
+    throw new Error(
+      `DTS scope ${scope} terminated without an exit status (${result.signal ?? "unknown signal"})`,
+    );
+  }
+  if (result.code === 75) {
+    throw new Error(
+      `Timed out after ${DTS_LOCK_TIMEOUT_SECONDS}s waiting for another bundled-DTS build`,
+    );
+  }
+  if (result.code !== 0) {
+    console.error(
+      `[build-bundled-dts] isolated scope ${scope} failed with exit ${result.code}`,
+    );
+  }
+  process.exitCode = result.code;
+}
+
 if (!isMainThread) {
   parentPort.postMessage(await generateBundle(workerData.entry));
 } else {
@@ -189,17 +345,45 @@ if (!isMainThread) {
 }
 
 async function main() {
+  const maxWorkers = resolveMaxWorkers();
+  const cgroup = readSelfCgroup();
+  const isolated = isInCgroupUnit(cgroup, DTS_SLICE);
+  if (!isolated) {
+    const sliceState = getDtsSliceState();
+    if (sliceState.loaded) {
+      await runInDtsScope(maxWorkers);
+      return;
+    }
+    if (isInCgroupUnit(cgroup, BB_SERVICE)) {
+      throw new Error(
+        `Refusing to build bundled declarations inside ${BB_SERVICE}: ` +
+          `${DTS_SLICE} is unavailable (${sliceState.detail})`,
+      );
+    }
+  }
+
   const generated = {};
   const queue = Object.entries(outputs);
-  const workers = Math.min(queue.length, availableParallelism());
-  await Promise.all(
-    Array.from({ length: workers }, async () => {
-      for (let next = queue.shift(); next; next = queue.shift()) {
-        const [fileName, entry] = next;
-        generated[fileName] = await generateInWorker(entry);
-      }
-    }),
+  const workers = Math.min(queue.length, availableParallelism(), maxWorkers);
+  console.log(
+    `[build-bundled-dts] workers=${workers} isolated=${isolated} pid=${process.pid}`,
   );
+  const activeWorkers = new Set();
+  try {
+    await Promise.all(
+      Array.from({ length: workers }, async () => {
+        for (let next = queue.shift(); next; next = queue.shift()) {
+          const [fileName, entry] = next;
+          generated[fileName] = await generateInWorker(entry, activeWorkers);
+        }
+      }),
+    );
+  } catch (error) {
+    await Promise.allSettled(
+      Array.from(activeWorkers, (worker) => worker.terminate()),
+    );
+    throw error;
+  }
   // Keep the declared order so a diff of the outputs stays readable.
   writeOutputs(
     Object.fromEntries(
@@ -208,15 +392,35 @@ async function main() {
   );
 }
 
-function generateInWorker(entry) {
+function generateInWorker(entry, activeWorkers) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL(import.meta.url), {
       workerData: { entry },
     });
-    worker.once("message", resolve);
-    worker.once("error", reject);
+    let result;
+    let receivedResult = false;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    activeWorkers.add(worker);
+    worker.once("message", (value) => {
+      result = value;
+      receivedResult = true;
+    });
+    worker.once("error", fail);
     worker.once("exit", (code) => {
-      if (code !== 0) reject(new Error(`bundle worker exited with ${code}`));
+      activeWorkers.delete(worker);
+      if (code !== 0) {
+        fail(new Error(`bundle worker exited with ${code}`));
+      } else if (!receivedResult) {
+        fail(new Error("bundle worker exited without returning a result"));
+      } else if (!settled) {
+        settled = true;
+        resolve(result);
+      }
     });
   });
 }
