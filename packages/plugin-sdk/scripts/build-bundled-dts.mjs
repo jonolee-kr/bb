@@ -266,25 +266,32 @@ function getDtsSliceState() {
 }
 
 function getDtsLockPath() {
-  const runtimeDir =
-    process.env.XDG_RUNTIME_DIR ||
-    (typeof process.getuid === "function"
+  // Provider sandboxes expose the shared BB thread-storage directory as
+  // writable while mounting /run/user read-only. Prefer that shared path so
+  // every worktree and provider still contends on one per-user lock.
+  const candidates = [
+    process.env.HOME
+      ? path.join(process.env.HOME, ".bb", "thread-storage")
+      : null,
+    process.env.XDG_RUNTIME_DIR,
+    typeof process.getuid === "function"
       ? `/run/user/${process.getuid()}`
-      : null);
-  if (!runtimeDir) {
-    throw new Error(
-      "Cannot determine the per-user runtime directory for the DTS build lock",
-    );
+      : null,
+  ].filter(Boolean);
+  const failures = [];
+  for (const directory of new Set(candidates)) {
+    try {
+      accessSync(directory, fsConstants.W_OK | fsConstants.X_OK);
+      return path.join(directory, ".bb-dts-build.lock");
+    } catch (error) {
+      failures.push(
+        `${directory}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
-  try {
-    accessSync(runtimeDir, fsConstants.W_OK | fsConstants.X_OK);
-  } catch (error) {
-    throw new Error(
-      `Cannot write the DTS build lock in ${runtimeDir}: ` +
-        `${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-  return path.join(runtimeDir, "bb-dts-build.lock");
+  throw new Error(
+    `Cannot find a writable directory for the DTS build lock (${failures.join("; ")})`,
+  );
 }
 
 async function runInDtsScope(maxWorkers, systemctlPath) {
