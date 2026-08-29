@@ -9,7 +9,7 @@ substantial memory.
 The build uses two resource controls.
 
 1. The internal worker pool limits concurrent declaration programs. The safe
-   default is two workers.
+   default is one worker.
 2. On supported Linux hosts, the entrypoint re-executes through `systemd-run`
    in `bb-dts.slice`.
 

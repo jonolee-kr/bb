@@ -27,7 +27,7 @@ describe("bundled DTS worker configuration", () => {
     },
   );
 
-  it("defaults to two workers on a large host", () => {
+  it("defaults to one worker on a large host", () => {
     expect(
       resolveWorkerConfiguration({
         args: [],
@@ -35,7 +35,7 @@ describe("bundled DTS worker configuration", () => {
         availableCpuCount: 16,
         outputCount: 15,
       }),
-    ).toMatchObject({ effective: 2, requested: 2, source: "default" });
+    ).toMatchObject({ effective: 1, requested: 1, source: "default" });
   });
 
   it("caps the effective workers by CPU and declaration counts", () => {

@@ -2,7 +2,7 @@ export const BB_DTS_MAX_WORKERS = "BB_DTS_MAX_WORKERS";
 export const BB_DTS_REEXEC = "BB_DTS_REEXEC";
 export const BB_DTS_SLICE = "bb-dts.slice";
 export const BB_SERVICE = "bb-jsl.service";
-export const DEFAULT_MAX_WORKERS = 2;
+export const DEFAULT_MAX_WORKERS = 1;
 export const MAX_WORKERS_LIMIT = 64;
 
 export function parseMaxWorkers(value, source) {
