@@ -7,11 +7,11 @@ import { TabPill } from "./tab-pill";
 afterEach(cleanup);
 
 const EXPECTED_CLOSE_BUTTON_CLASS =
-  "pointer-events-none absolute left-1.5 top-1/2 z-10 -translate-y-1/2 inline-flex size-4 shrink-0 items-center justify-center rounded-sm hover:bg-muted-foreground/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none max-md:pointer-coarse:size-5 opacity-0 hover:opacity-100 group-hover/tab-pill:pointer-events-auto group-hover/tab-pill:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 disabled:opacity-30 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100";
+  "pointer-events-none absolute left-1.5 top-1/2 z-10 -translate-y-1/2 inline-flex size-4 shrink-0 items-center justify-center rounded-sm hover:bg-muted-foreground/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none pointer-coarse:size-5 opacity-0 hover:opacity-100 group-hover/tab-pill:pointer-events-auto group-hover/tab-pill:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 disabled:opacity-30 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100";
 const EXPECTED_CLOSABLE_LEADING_VISUAL_CLASS =
-  "inline-flex size-4 shrink-0 items-center justify-center [&_svg]:size-3.5 max-md:pointer-coarse:size-5 max-md:pointer-coarse:[&_svg]:size-5 mr-1.5 group-hover/tab-pill:opacity-0 tab-pill-close-focus-visible:opacity-0 pointer-coarse:opacity-0";
+  "inline-flex size-4 shrink-0 items-center justify-center [&_svg]:size-3.5 pointer-coarse:size-5 pointer-coarse:[&_svg]:size-5 mr-1.5 group-hover/tab-pill:opacity-0 tab-pill-close-focus-visible:opacity-0 pointer-coarse:opacity-0";
 const EXPECTED_LEADING_VISUAL_CLASS =
-  "inline-flex size-4 shrink-0 items-center justify-center [&_svg]:size-3.5 max-md:pointer-coarse:size-5 max-md:pointer-coarse:[&_svg]:size-5 mr-1.5";
+  "inline-flex size-4 shrink-0 items-center justify-center [&_svg]:size-3.5 pointer-coarse:size-5 pointer-coarse:[&_svg]:size-5 mr-1.5";
 
 function getLeadingVisual() {
   const leadingVisual = screen.getByTestId("leading-visual").parentElement;
@@ -33,10 +33,14 @@ function renderClosableTab() {
     />,
   );
 
-  return {
-    closeButton: screen.getByRole("button", { name: "Close Browser" }),
-    leadingVisual: getLeadingVisual(),
-  };
+  const closeButton = screen.getByRole("button", { name: "Close Browser" });
+  const closeIcon = closeButton.querySelector("svg");
+  const pill = closeButton.parentElement;
+  if (!closeIcon || !pill) {
+    throw new Error("Expected a close icon and pill container");
+  }
+
+  return { closeButton, closeIcon, leadingVisual: getLeadingVisual(), pill };
 }
 
 describe("TabPill", () => {
@@ -109,7 +113,7 @@ describe("TabPill", () => {
   });
 
   it("does not width-gate close visibility or pointer interaction", () => {
-    const { closeButton, leadingVisual } = renderClosableTab();
+    const { closeButton, closeIcon, leadingVisual, pill } = renderClosableTab();
 
     expect(closeButton.classList).not.toContain(
       "max-md:pointer-coarse:pointer-events-auto",
@@ -120,6 +124,15 @@ describe("TabPill", () => {
     expect(leadingVisual.classList).not.toContain(
       "max-md:pointer-coarse:opacity-0",
     );
+    expect(
+      [closeButton, closeIcon, leadingVisual, pill].flatMap((element) =>
+        [
+          "max-md:pointer-coarse:size-5",
+          "max-md:pointer-coarse:[&_svg]:size-5",
+          "max-md:pointer-coarse:h-9",
+        ].filter((className) => element.classList.contains(className)),
+      ),
+    ).toEqual([]);
   });
 
   it("keeps a leading visual visible without a close action", () => {
