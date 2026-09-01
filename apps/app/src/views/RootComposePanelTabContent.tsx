@@ -10,6 +10,7 @@ import type {
 import type { SecondaryPanelPaneRenderContext } from "@/components/secondary-panel/ThreadSecondaryPanel";
 import {
   LazyFilePreview,
+  LazyByteFilePreviewTabContent,
   LazyHostFilePreviewTabContent,
   LazyNewTabPage,
   LazyProjectFilePreviewTabContent,
@@ -36,9 +37,18 @@ import {
   resolveEnvironmentOpenContext,
 } from "./thread-detail/threadWorkspaceOpenPath";
 import { getFilePreviewLineRangeStart } from "@bb/client-core";
-import { resolveAbsoluteFilePath } from "@/lib/absolute-file-path";
+import {
+  getAbsoluteDirname,
+  resolveAbsoluteFilePath,
+} from "@/lib/absolute-file-path";
 import { useAppCommandHandler } from "@/components/commands/AppCommandProvider";
 import type { MarkdownPreviewLinkHandler } from "@/components/ui/markdown-link";
+import type { MarkdownPreviewLocalFileLinkHandler } from "@/components/ui/markdown-local-file-link";
+import { identityFromByteFileTab } from "@/lib/file-resolver";
+import {
+  buildMarkdownFilePreviewRouting,
+  resolveMarkdownFilePreviewRootPath,
+} from "@/components/secondary-panel/markdown-file-preview-routing";
 
 export const ROOT_COMPOSE_FIXED_PANEL_STATE_ID = "root-compose";
 
@@ -57,6 +67,7 @@ interface RootComposePanelTabContentProps {
   onAutoFocusNewTabHandled: () => void;
   onAutoFocusTerminalHandled: () => void;
   onOpenBrowser: () => void;
+  onOpenLocalFileLink: MarkdownPreviewLocalFileLinkHandler;
   onOpenPanelLink: MarkdownPreviewLinkHandler;
   onSelectFileSearchResult: (selection: FileSearchSelection) => void;
   onSelectionAddToChat: (text: string) => void;
@@ -81,6 +92,8 @@ interface RootComposeFilePreviewTabContentProps {
   isPanelOpen: boolean;
   isProjectless: boolean;
   fileOpenerSource: PluginFileOpenerSource | null;
+  onOpenLocalFileLink: MarkdownPreviewLocalFileLinkHandler;
+  onOpenPanelLink: MarkdownPreviewLinkHandler;
   onSelectionAddToChat: (text: string) => void;
   pluginPanelTab?: PluginPanelFixedPanelTab;
   primaryHostId: string | null;
@@ -142,6 +155,7 @@ export function RootComposePanelTabContent({
   onAutoFocusNewTabHandled,
   onAutoFocusTerminalHandled,
   onOpenBrowser,
+  onOpenLocalFileLink,
   onOpenPanelLink,
   onSelectFileSearchResult,
   onSelectionAddToChat,
@@ -216,6 +230,14 @@ export function RootComposePanelTabContent({
           showFileSearch={!isProjectless}
         />
       );
+    case "byte-file-preview":
+      return (
+        <LazyByteFilePreviewTabContent
+          identity={identityFromByteFileTab(tab)}
+          isPanelOpen={isPanelOpen}
+          onSelectionAddToChat={onSelectionAddToChat}
+        />
+      );
     case "workspace-file-preview":
     case "host-file-preview":
     case "thread-storage-file-preview":
@@ -226,6 +248,8 @@ export function RootComposePanelTabContent({
           isFocused={pane.isFocused}
           isPanelOpen={isPanelOpen}
           isProjectless={isProjectless}
+          onOpenLocalFileLink={onOpenLocalFileLink}
+          onOpenPanelLink={onOpenPanelLink}
           onSelectionAddToChat={onSelectionAddToChat}
           primaryHostId={primaryHostId}
           projectSources={projectSources}
@@ -257,6 +281,8 @@ export function RootComposePanelTabContent({
           isFocused={pane.isFocused}
           isPanelOpen={isPanelOpen}
           isProjectless={isProjectless}
+          onOpenLocalFileLink={onOpenLocalFileLink}
+          onOpenPanelLink={onOpenPanelLink}
           onSelectionAddToChat={onSelectionAddToChat}
           pluginPanelTab={tab}
           primaryHostId={primaryHostId}
@@ -279,6 +305,8 @@ function RootComposeFilePreviewTabContent({
   isPanelOpen,
   isProjectless,
   onSelectionAddToChat,
+  onOpenLocalFileLink,
+  onOpenPanelLink,
   pluginPanelTab,
   primaryHostId,
   projectSources,
@@ -432,6 +460,21 @@ function RootComposeFilePreviewTabContent({
             environmentId={tab.environmentId}
             isPanelOpen={isPanelOpen}
             lineRange={tab.lineRange}
+            markdownLinkRouting={buildMarkdownFilePreviewRouting({
+              baseDir: copyPath
+                ? getAbsoluteDirname({ path: copyPath })
+                : undefined,
+              contentSource: {
+                environmentId: tab.environmentId,
+                fileSource: tab.source,
+                kind: "workspace",
+                projectId: currentProjectId,
+                threadId: rootPanelThreadId,
+              },
+              onOpenLink: onOpenPanelLink,
+              onOpenLocalFileLink,
+              rootPath: workspaceRootPath,
+            })}
             onOpenInEditor={onOpenInEditor}
             onSelectionAddToChat={onSelectionAddToChat}
             source={tab.source}
@@ -446,6 +489,20 @@ function RootComposeFilePreviewTabContent({
             hostId={projectFilePreviewRouting.hostId}
             isPanelOpen={isPanelOpen}
             lineRange={tab.lineRange}
+            markdownLinkRouting={buildMarkdownFilePreviewRouting({
+              baseDir: copyPath
+                ? getAbsoluteDirname({ path: copyPath })
+                : undefined,
+              contentSource: {
+                environmentId: projectFilePreviewRouting.environmentId,
+                hostId: projectFilePreviewRouting.hostId,
+                kind: "project",
+                projectId: projectPreviewId,
+              },
+              onOpenLink: onOpenPanelLink,
+              onOpenLocalFileLink,
+              rootPath: projectPreviewRootPath,
+            })}
             onOpenInEditor={onOpenInEditor}
             onSelectionAddToChat={onSelectionAddToChat}
             projectId={projectPreviewId}
@@ -473,6 +530,16 @@ function RootComposeFilePreviewTabContent({
             environmentId={environmentId}
             isPanelOpen={isPanelOpen}
             lineRange={tab.lineRange}
+            markdownLinkRouting={buildMarkdownFilePreviewRouting({
+              baseDir: getAbsoluteDirname({ path: tab.path }),
+              contentSource: { kind: "host", threadId },
+              onOpenLink: onOpenPanelLink,
+              onOpenLocalFileLink,
+              rootPath: resolveMarkdownFilePreviewRootPath({
+                filePath: tab.path,
+                rootPaths: [workspaceRootPath, threadStorageRootPath],
+              }),
+            })}
             onOpenInEditor={onOpenInEditor}
             onSelectionAddToChat={onSelectionAddToChat}
             threadId={threadId}
@@ -498,6 +565,18 @@ function RootComposeFilePreviewTabContent({
           copyPath={copyPath}
           isPanelOpen={isPanelOpen}
           lineRange={tab.lineRange}
+          markdownLinkRouting={buildMarkdownFilePreviewRouting({
+            baseDir: copyPath
+              ? getAbsoluteDirname({ path: copyPath })
+              : undefined,
+            contentSource: {
+              kind: "thread-storage",
+              threadId: storageThreadId,
+            },
+            onOpenLink: onOpenPanelLink,
+            onOpenLocalFileLink,
+            rootPath: threadStorageRootPath,
+          })}
           onOpenInEditor={onOpenInEditor}
           onSelectionAddToChat={onSelectionAddToChat}
           threadId={storageThreadId}

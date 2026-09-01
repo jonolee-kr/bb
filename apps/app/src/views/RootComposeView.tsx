@@ -119,6 +119,8 @@ import {
   useOpenLinksInAppBrowserPreference,
 } from "@/lib/in-app-browser-link-preference";
 import type { MarkdownPreviewLinkHandler } from "@/components/ui/markdown-link";
+import type { MarkdownPreviewLocalFileLinkHandler } from "@/components/ui/markdown-local-file-link";
+import { appToast } from "@/components/ui/app-toast";
 import { UrlOpenRoutingProvider } from "@/lib/url-open-routing";
 import {
   AppNavigationHostProvider,
@@ -126,6 +128,7 @@ import {
   type AppFixedTabOpenIntent,
 } from "@/lib/app-navigation-host";
 import { openAppFixedTabFromDestinations } from "@/lib/app-fixed-tab-navigation";
+import { byteFileTabFromIdentity } from "@/lib/file-resolver";
 import {
   normalizeExperimentalFileOpenOptions,
   toFilePreviewLineRange,
@@ -180,6 +183,7 @@ import {
   RootComposePanelTabContent,
   type RootComposeTerminalTarget,
 } from "./RootComposePanelTabContent";
+import { resolveThreadLocalFileLink } from "@/lib/thread-local-file-links";
 
 const ROOT_COMPOSE_SIDEBAR_ACTION_ALIGNED_TOP_PADDING_CLASS = "pt-14";
 
@@ -950,16 +954,24 @@ function RootComposeSurface({
         : rootPanelHostPathTerminalTarget,
     [rootPanelEnvironmentId, rootPanelHostPathTerminalTarget],
   );
-  const { threadStorageFiles: rootThreadStorageFiles } = useThreadStorageViewer(
-    {
-      fileListEnabled: shouldLoadThreadStorageFileList({
-        hasThread: rootPanelThreadId !== null,
-        isSecondaryPanelOpen,
-        secondaryTabs: fixedPanelTabsState.secondary.tabs,
-      }),
-      threadId: rootPanelThreadId ?? undefined,
-    },
-  );
+  const {
+    checkThreadStorageFileExists: checkRootThreadStorageFileExists,
+    threadStorageFiles: rootThreadStorageFiles,
+  } = useThreadStorageViewer({
+    fileListEnabled: shouldLoadThreadStorageFileList({
+      hasThread: rootPanelThreadId !== null,
+      isSecondaryPanelOpen,
+      secondaryTabs: fixedPanelTabsState.secondary.tabs,
+    }),
+    threadId: rootPanelThreadId ?? undefined,
+  });
+  const rootPanelWorkspaceRootPath =
+    rootPanelEnvironment?.path ??
+    (rootPanelHostPathTerminalTarget?.kind === "host_path"
+      ? rootPanelHostPathTerminalTarget.cwd
+      : null);
+  const rootPanelThreadStorageRootPath =
+    rootThreadStorageFiles?.storageRootPath ?? null;
   const environmentTerminalsListQuery = useEnvironmentTerminals(
     rootPanelEnvironmentId ?? "",
     {
@@ -1018,6 +1030,7 @@ function RootComposeSurface({
     openPluginPanel,
     openTab,
     orderedSecondaryFileTabs,
+    reopenClosedTab,
     reorderTab,
     selectFileSearchResult,
     updateBrowserTab,
@@ -1030,7 +1043,8 @@ function RootComposeSurface({
     projectHostId: rootProjectHostId,
     projectId: isProjectless ? null : projectId,
     retainedTerminalId,
-    storageFiles: rootThreadStorageFiles?.files,
+    storageFileExists: checkRootThreadStorageFileExists,
+    storageFiles: rootThreadStorageFiles,
     terminalSessions: loadedTerminalSessions,
   });
   const rootPluginPanelActions = usePluginNewThreadPanelActions({
@@ -1126,22 +1140,74 @@ function RootComposeSurface({
     openPersistedWorkspaceFile,
     togglePersistedPanel: toggleRootPersistedSecondaryPanel,
   });
+  const handleOpenRootPanelLocalFileLink =
+    useCallback<MarkdownPreviewLocalFileLinkHandler>(
+      (link) => {
+        const resolution = resolveThreadLocalFileLink({
+          hostFileLinksAvailable:
+            rootPanelThreadId !== null && rootPanelEnvironmentId !== null,
+          link,
+          threadStorageRootPath: rootPanelThreadStorageRootPath,
+          workspaceRootPath: rootPanelWorkspaceRootPath,
+        });
+        if (resolution.kind === "app-route") {
+          return false;
+        }
+        if (resolution.kind === "error") {
+          appToast.error("Failed to open file locally", {
+            description: resolution.description,
+          });
+          return true;
+        }
+        if (resolution.kind === "open-workspace-path") {
+          openWorkspaceFile({
+            lineRange: resolution.request.lineRange,
+            path: resolution.request.relativePath,
+            source: { kind: "working-tree" },
+            statusLabel: null,
+          });
+          return true;
+        }
+        if (resolution.kind === "open-thread-storage-path") {
+          openStorageFile({
+            lineRange: resolution.request.lineRange,
+            path: resolution.request.relativePath,
+          });
+          return true;
+        }
+        openHostFile({
+          lineRange: resolution.request.lineRange,
+          path: resolution.request.path,
+        });
+        return true;
+      },
+      [
+        openHostFile,
+        openStorageFile,
+        openWorkspaceFile,
+        rootPanelEnvironmentId,
+        rootPanelThreadId,
+        rootPanelThreadStorageRootPath,
+        rootPanelWorkspaceRootPath,
+      ],
+    );
   const handleOpenLiveFilePreview = useCallback(
     (intent: AppFilePreviewIntent): boolean => {
       const normalized = normalizeExperimentalFileOpenOptions(intent);
       if (normalized === null) return false;
-      const lineRange = toFilePreviewLineRange(normalized.location);
+      const lineRange = toFilePreviewLineRange(normalized.identity.location);
       const options =
         intent.viewer === undefined ? undefined : { viewer: intent.viewer };
-      switch (normalized.target.kind) {
+      const { source } = normalized.identity;
+      switch (source.store) {
         case "workspace":
-          if (normalized.target.environmentId !== rootPanelEnvironmentId) {
+          if (source.ownerId !== rootPanelEnvironmentId) {
             return false;
           }
           openWorkspaceFile(
             {
               lineRange,
-              path: normalized.target.path,
+              path: source.path,
               source: { kind: "working-tree" },
               statusLabel: null,
             },
@@ -1151,22 +1217,44 @@ function RootComposeSurface({
         case "host":
           if (
             rootPanelThreadId === null ||
-            normalized.target.hostId !== rootPanelEnvironment?.hostId
+            source.ownerId !== rootPanelEnvironment?.hostId
           ) {
             return false;
           }
-          openHostFile({ lineRange, path: normalized.target.path }, options);
+          openHostFile({ lineRange, path: source.path }, options);
+          return true;
+        case "thread-host":
+          if (source.ownerId !== rootPanelThreadId) return false;
+          openHostFile({ lineRange, path: source.path }, options);
           return true;
         case "thread-storage":
-          if (normalized.target.threadId !== rootPanelThreadId) return false;
-          openStorageFile({ lineRange, path: normalized.target.path }, options);
+          if (source.ownerId !== rootPanelThreadId) return false;
+          openStorageFile({ lineRange, path: source.path }, options);
+          return true;
+        case "project-attachment":
+          if (source.ownerId !== projectId) return false;
+          break;
+        case "tasks-attachment":
+          break;
+        case "remote":
+          if (rootPanelThreadId === null) return false;
+          openTab({ kind: "browser", url: source.url });
+          openCompactDrawer();
           return true;
       }
+      const byteTab = byteFileTabFromIdentity(normalized.identity);
+      return (
+        byteTab !== null &&
+        openTab({ kind: "byte-file-preview", tab: byteTab }) !== null
+      );
     },
     [
       openHostFile,
       openStorageFile,
       openWorkspaceFile,
+      openCompactDrawer,
+      openTab,
+      projectId,
       rootPanelEnvironment?.hostId,
       rootPanelEnvironmentId,
       rootPanelThreadId,
@@ -1358,6 +1446,11 @@ function RootComposeSurface({
     handleOpenNewTab();
     return true;
   });
+  useAppCommandHandler("panel.reopenClosedTab", () => {
+    if (!isFocusedPane || !reopenClosedTab()) return false;
+    openCompactDrawer();
+    return true;
+  });
   useAppCommandHandler("file.quickOpen", () => {
     if (!isFocusedPane) return false;
     handleOpenNewTab();
@@ -1532,6 +1625,7 @@ function RootComposeSurface({
         onAutoFocusNewTabHandled={handleNewTabAutoFocusHandled}
         onAutoFocusTerminalHandled={handleTerminalAutoFocusHandled}
         onOpenBrowser={openBrowserTabAndReveal}
+        onOpenLocalFileLink={handleOpenRootPanelLocalFileLink}
         onOpenPanelLink={handleOpenPanelLink}
         onSelectFileSearchResult={handleSelectFileSearchResult}
         onSelectionAddToChat={handleRootPanelSelectionAddToChat}
@@ -1556,6 +1650,7 @@ function RootComposeSurface({
       canCreateRootTerminal,
       handleNewTabAutoFocusHandled,
       handleOpenPanelLink,
+      handleOpenRootPanelLocalFileLink,
       handleRootPanelSelectionAddToChat,
       handleSelectFileSearchResult,
       handleStartTerminal,
@@ -1660,6 +1755,14 @@ function RootComposeSurface({
               label: filenameOf(tab.path),
               isPinned: tab.isPinned,
               leadingVisual: <RightPanelFileTabIcon path={tab.path} />,
+              statusLabel: null,
+              onSelect: () => handleActivateFileTab(tab.id),
+            };
+          case "byte-file-preview":
+            return {
+              ...shared,
+              label: tab.displayName,
+              leadingVisual: <RightPanelFileTabIcon path={tab.displayName} />,
               statusLabel: null,
               onSelect: () => handleActivateFileTab(tab.id),
             };

@@ -270,7 +270,7 @@ describe("MarkdownPreview", () => {
     expect(container.textContent).toContain("<script>alert(1)</script>");
   });
 
-  it("renders inline-code Markdown file paths as local file links", () => {
+  it("renders inline-code file paths as local file links", () => {
     render(
       <MarkdownPreview
         content="Read `README.md`, `docs/guide.markdown:4`, and `src/app.ts`."
@@ -286,7 +286,24 @@ describe("MarkdownPreview", () => {
         .getByRole("link", { name: "docs/guide.markdown:4" })
         .getAttribute("href"),
     ).toBe("file:///workspace/docs/guide.markdown#L4");
-    expect(screen.getByText("src/app.ts").tagName).toBe("CODE");
+    expect(
+      screen.getByRole("link", { name: "src/app.ts" }).getAttribute("href"),
+    ).toBe("file:///workspace/src/app.ts");
+  });
+
+  it("keeps common dotted code tokens inert", () => {
+    const tokens = ["Array.from", "user.name", "os.path", "self.value"];
+    render(
+      <MarkdownPreview
+        content={tokens.map((token) => `\`${token}\``).join(" ")}
+        linkRouting={workspaceLinkRouting}
+      />,
+    );
+
+    for (const token of tokens) {
+      expect(screen.queryByRole("link", { name: token })).toBeNull();
+      expect(screen.getByText(token).tagName).toBe("CODE");
+    }
   });
 
   it("shows a context menu on local file links when the context provides items", () => {
@@ -373,13 +390,16 @@ describe("MarkdownPreview", () => {
         content={[
           "![absolute](/workspace/generated.png)",
           "![relative](art/chart.png)",
+          "![parent](../shared.png)",
           "![remote](https://example.com/image.png)",
+          "![data](data:image/png;base64,AAAA)",
+          "![escape](../../secret.png)",
         ].join("\n\n")}
         linkRouting={{
           localImage: {
             absolutePaths: { kind: "trusted-host" },
             relativePaths: {
-              baseDir: "/workspace",
+              baseDir: "/workspace/docs",
               rootPath: "/workspace",
             },
             resolveSrc,
@@ -393,11 +413,59 @@ describe("MarkdownPreview", () => {
     ).toBe("/api/files/content?path=%2Fworkspace%2Fgenerated.png");
     expect(
       container.querySelector('img[alt="relative"]')?.getAttribute("src"),
-    ).toBe("/api/files/content?path=%2Fworkspace%2Fart%2Fchart.png");
+    ).toBe("/api/files/content?path=%2Fworkspace%2Fdocs%2Fart%2Fchart.png");
+    expect(
+      container.querySelector('img[alt="parent"]')?.getAttribute("src"),
+    ).toBe("/api/files/content?path=%2Fworkspace%2Fshared.png");
     expect(
       container.querySelector('img[alt="remote"]')?.getAttribute("src"),
     ).toBe("https://example.com/image.png");
-    expect(resolveSrc).toHaveBeenCalledTimes(2);
+    expect(
+      container.querySelector('img[alt="data"]')?.hasAttribute("src") ?? false,
+    ).toBe(false);
+    expect(
+      container.querySelector('img[alt="escape"]')?.getAttribute("src"),
+    ).toBe("../../secret.png");
+    expect(resolveSrc).toHaveBeenCalledTimes(3);
+  });
+
+  it("routes relative video, audio, and source resources beside the Markdown file", () => {
+    const resolveSrc = vi.fn(
+      ({ path }: { path: string }) =>
+        `/api/files/preview?path=${encodeURIComponent(path)}`,
+    );
+    const { container } = render(
+      <MarkdownPreview
+        allowHtml
+        content={[
+          '<video controls src="media/clip.mp4">',
+          '<source src="../shared/clip.webm">',
+          "</video>",
+          '<audio controls src="media/sound.ogg"></audio>',
+        ].join("\n")}
+        linkRouting={{
+          localImage: {
+            absolutePaths: { kind: "contained", rootPath: "/workspace" },
+            relativePaths: {
+              baseDir: "/workspace/docs",
+              rootPath: "/workspace",
+            },
+            resolveSrc,
+          },
+        }}
+      />,
+    );
+
+    expect(container.querySelector("video")?.getAttribute("src")).toBe(
+      "/api/files/preview?path=%2Fworkspace%2Fdocs%2Fmedia%2Fclip.mp4",
+    );
+    expect(container.querySelector("source")?.getAttribute("src")).toBe(
+      "/api/files/preview?path=%2Fworkspace%2Fshared%2Fclip.webm",
+    );
+    expect(container.querySelector("audio")?.getAttribute("src")).toBe(
+      "/api/files/preview?path=%2Fworkspace%2Fdocs%2Fmedia%2Fsound.ogg",
+    );
+    expect(resolveSrc).toHaveBeenCalledTimes(3);
   });
 
   it("keeps absolute app-origin URLs on the app-route path", () => {

@@ -1,13 +1,16 @@
-import { readFile, stat } from "node:fs/promises";
+import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { createTasksStore } from "../db";
 import {
+  buildAttachmentDownloadUrl,
   buildAttachmentUrl,
   deleteAttachmentById,
   MAX_ATTACHMENT_SIZE_BYTES,
+  readAttachmentContent,
   registerAttachments,
+  saveAttachmentFromBytes,
 } from ".";
 
 function setup(options?: Parameters<typeof registerAttachments>[2]) {
@@ -29,7 +32,7 @@ function setup(options?: Parameters<typeof registerAttachments>[2]) {
     .all()
     .find((entry) => entry.name === "main");
   if (!database) throw new Error("test database path is missing");
-  return { bb, harness, store, task, root: dirname(database.file) };
+  return { bb, db, harness, store, task, root: dirname(database.file) };
 }
 
 async function upload(
@@ -136,7 +139,7 @@ describe("task attachments", () => {
     }
   });
 
-  it("downloads with image-aware headers", async () => {
+  it("serves separate preview and download headers for raster images", async () => {
     const { harness, task } = setup();
     try {
       const uploaded = await upload(
@@ -147,19 +150,198 @@ describe("task attachments", () => {
       const { attachmentId } = (await uploaded.json()) as {
         attachmentId: string;
       };
-      const response = await harness.fetchHttp(
+      const preview = await harness.fetchHttp(
+        "GET",
+        `/attachments/preview?attachmentId=${attachmentId}`,
+      );
+      const download = await harness.fetchHttp(
         "GET",
         `/attachments/download?attachmentId=${attachmentId}`,
       );
 
-      expect(response.status).toBe(200);
-      expect(response.headers.get("content-type")).toBe("image/png");
-      expect(response.headers.get("content-disposition")).toBe(
+      expect(buildAttachmentUrl(attachmentId)).toContain(
+        "/attachments/preview?",
+      );
+      expect(buildAttachmentDownloadUrl(attachmentId)).toContain(
+        "/attachments/download?",
+      );
+      expect(preview.status).toBe(200);
+      expect(preview.headers.get("content-type")).toBe("image/png");
+      expect(preview.headers.get("content-disposition")).toBe(
         `inline; filename="image.png"; filename*=UTF-8''image.png`,
       );
-      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
-      await expect(response.text()).resolves.toBe("image");
+      expect(download.headers.get("content-disposition")).toBe(
+        `attachment; filename="image.png"; filename*=UTF-8''image.png`,
+      );
+      expect(preview.headers.get("x-content-type-options")).toBe("nosniff");
+      await expect(preview.text()).resolves.toBe("image");
     } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("uses a supported filename MIME for generic stored metadata", async () => {
+    const { harness, store, task } = setup();
+    try {
+      const uploaded = await upload(
+        harness,
+        task.id,
+        new TextEncoder().encode("pdf bytes"),
+        "report.pdf",
+        "application/octet-stream",
+      );
+      const { attachmentId } = (await uploaded.json()) as {
+        attachmentId: string;
+      };
+      expect(store.getAttachment(attachmentId)?.mime).toBe("application/pdf");
+
+      store.updateAttachment(attachmentId, {
+        mime: "application/octet-stream",
+      });
+      const preview = await harness.fetchHttp(
+        "GET",
+        `/attachments/preview?attachmentId=${attachmentId}`,
+      );
+      const download = await harness.fetchHttp(
+        "GET",
+        `/attachments/download?attachmentId=${attachmentId}`,
+      );
+
+      expect(preview.headers.get("content-type")).toBe("application/pdf");
+      expect(download.headers.get("content-type")).toBe("application/pdf");
+      expect(preview.headers.get("content-disposition")).toContain("inline;");
+      expect(download.headers.get("content-disposition")).toContain(
+        "attachment;",
+      );
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("sandboxes active preview MIME types without weakening download headers", async () => {
+    const { harness, task } = setup();
+    try {
+      const uploaded = await upload(
+        harness,
+        task.id,
+        new TextEncoder().encode(
+          "<script>parent.postMessage('x','*')</script>",
+        ),
+        "unsafe.html",
+        "text/html",
+      );
+      const { attachmentId } = (await uploaded.json()) as {
+        attachmentId: string;
+      };
+      const preview = await harness.fetchHttp(
+        "GET",
+        `/attachments/preview?attachmentId=${attachmentId}`,
+      );
+      const download = await harness.fetchHttp(
+        "GET",
+        `/attachments/download?attachmentId=${attachmentId}`,
+      );
+
+      expect(preview.headers.get("content-disposition")).toContain("inline;");
+      expect(preview.headers.get("content-security-policy")).toContain(
+        "sandbox",
+      );
+      expect(download.headers.get("content-disposition")).toContain(
+        "attachment;",
+      );
+      expect(download.headers.get("content-security-policy")).toBeNull();
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it.each([
+    ["unsafe.html", "text/html"],
+    ["unsafe.xhtml", "application/xhtml+xml"],
+    ["unsafe.rdf", "application/rdf+xml"],
+    ["unsafe.xml", "application/xml"],
+    ["unsafe.txt", "text/xml"],
+    ["unsafe.mathml", "text/mathml"],
+    ["unsafe.svg", "image/svg+xml"],
+  ])("applies the shared sandbox policy to %s", async (fileName, mime) => {
+    const { harness, task } = setup();
+    try {
+      const uploaded = await upload(
+        harness,
+        task.id,
+        new TextEncoder().encode("<script>parent.document</script>"),
+        fileName,
+        mime,
+      );
+      const { attachmentId } = (await uploaded.json()) as {
+        attachmentId: string;
+      };
+      const preview = await harness.fetchHttp(
+        "GET",
+        `/attachments/preview?attachmentId=${attachmentId}`,
+      );
+      const download = await harness.fetchHttp(
+        "GET",
+        `/attachments/download?attachmentId=${attachmentId}`,
+      );
+
+      expect(preview.headers.get("content-type")).toBe(mime);
+      expect(preview.headers.get("content-security-policy")).toBe(
+        "sandbox allow-scripts",
+      );
+      expect(download.headers.get("content-security-policy")).toBeNull();
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("sanitizes filenames supplied through direct byte saves", async () => {
+    const { harness, store, task } = setup();
+    try {
+      const attachment = await saveAttachmentFromBytes(
+        store,
+        new TextEncoder().encode("unsafe name"),
+        {
+          taskId: task.id,
+          fileName: "../../unsafe?.txt",
+          mime: "text/plain",
+        },
+      );
+
+      expect(attachment.fileName).toBe("unsafe_.txt");
+      expect(attachment.blobPath).toBe(
+        join("blobs", attachment.id, "unsafe_.txt"),
+      );
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("refuses stored blob paths outside the plugin data directory", async () => {
+    const { db, harness, root, store, task } = setup();
+    const outsideName = `outside-${task.id}.txt`;
+    const outsidePath = join(root, "..", outsideName);
+    try {
+      const attachment = await saveAttachmentFromBytes(
+        store,
+        new TextEncoder().encode("inside"),
+        {
+          taskId: task.id,
+          fileName: "inside.txt",
+          mime: "text/plain",
+        },
+      );
+      await writeFile(outsidePath, "outside");
+      db.prepare<[string, string]>(
+        "UPDATE attachments SET blob_path = ? WHERE id = ?",
+      ).run(join("..", outsideName), attachment.id);
+
+      await expect(readAttachmentContent(store, attachment.id)).rejects.toThrow(
+        "Attachment blob path escapes the plugin data directory",
+      );
+      await expect(readFile(outsidePath, "utf8")).resolves.toBe("outside");
+    } finally {
+      await rm(outsidePath, { force: true });
       await harness.dispose();
     }
   });
